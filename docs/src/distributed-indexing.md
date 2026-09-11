@@ -259,12 +259,19 @@ def vector_search(
 | `oversample_factor` | `float`, optional | Multiplier for local worker candidates. Each worker returns at least `nearest["k"] * oversample_factor` rows before driver-side merge. Must be greater than or equal to 1. |
 | `include_unindexed` | `bool`, optional | Include fragments not covered by vector index segments using separate flat-search fallback plans. Fallback plans use regular fragment scans and compute vector distance in Lance-Ray. Ignored when `fast_search=True`. |
 | `fast_search` | `bool`, optional | Search only indexed data. When enabled, Lance-Ray does not schedule flat-search fallback plans for fragments not covered by vector index segments. |
-| `analyze_plan` | `bool`, optional | If `True`, call `LanceScanner.analyze_plan()` for each planned shard and return a string containing the per-shard analysis instead of executing search and returning a table. |
+| `analyze_plan` | `bool`, optional | If `True`, execute `LanceScanner.analyze_plan()` for each planned shard and return runtime metrics as a string. This skips Lance-Ray's fallback distance computation and global top-k merge, but still executes the underlying scanners. |
 | `scanner_options` | `Dict[str, Any]`, optional | Extra Lance scanner options, such as `batch_size`, `prefilter`, `with_row_id`, or `late_materialization`. Lance-Ray manages `nearest`, `fragments`, `index_segments`, `fast_search`, `limit`, and `offset` internally, so those options cannot be supplied here. |
 
 #### Return Value
 
 The function returns a `pyarrow.Table` containing the global top-k rows sorted by `_distance`. If `analyze_plan=True`, it returns a `str` containing one Lance scanner analysis section per planned shard.
+
+Indexed and unindexed candidates use the same distance convention as Lance:
+L2 is squared Euclidean distance (`sum((q - v) ** 2)`), cosine is
+`1 - cosine_similarity(q, v)`, and dot is `1 - dot(q, v)`. All are sorted in
+ascending order. If `nearest["metric"]` is omitted, flat fallback plans use the
+selected index's metric; when no index exists, the default is L2. Approximate
+index scores can still differ from exact flat-search distances.
 
 ## Examples
 
