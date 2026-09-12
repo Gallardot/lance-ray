@@ -1,16 +1,23 @@
 """Test cases for lance_ray.fragment module."""
 
+import io
+import tempfile
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import IO, Any, Optional, cast
 
 import lance
 import lance_ray.io as lr
 import pyarrow as pa
 import pytest
 import ray
+from lance.fragment import FragmentMetadata
 from lance_ray.datasink import LanceDatasink, LanceFragmentCommitter
-from lance_ray.fragment import LanceFragmentWriter
+from lance_ray.fragment import LanceFragmentWriter, write_fragment
+
+import pandas as pd
 
 
 def _legacy_write_fragments(
@@ -27,6 +34,382 @@ def _write_fragments_with_external_blob_options(
     allow_external_blob_outside_bases: bool = False,
 ) -> list[Any]:
     return []
+
+
+@pytest.mark.parametrize("failure_after_batches", [1, 5, 10])
+@pytest.mark.parametrize("failures", [1, 2])
+@pytest.mark.parametrize("explicit_max_attempts", [False, True])
+def test_write_fragment_retry_replays_complete_input(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_after_batches: int,
+    failures: int,
+    explicit_max_attempts: bool,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    batch_rows = 4_096
+    expected_ids = list(range(batch_rows * 10))
+    attempts: list[list[int]] = []
+    readers: list[pa.RecordBatchReader] = []
+    generated_batches: list[int] = []
+
+    def input_blocks() -> Iterator[pa.Table]:
+        for batch_index in range(10):
+            generated_batches.append(batch_index)
+            yield pa.table(
+                {"id": range(batch_index * batch_rows, (batch_index + 1) * batch_rows)}
+            )
+
+    def partially_failing_write(
+        reader: pa.RecordBatchReader, _uri: str, **_kwargs: Any
+    ) -> list[FragmentMetadata]:
+        readers.append(reader)
+        ids: list[int] = []
+        attempts.append(ids)
+        for batch_index, batch in enumerate(reader, start=1):
+            ids.extend(cast("list[int]", batch.column("id").to_pylist()))
+            if len(attempts) <= failures and batch_index == failure_after_batches:
+                raise RuntimeError("LanceError(IO): injected write failure")
+        return [FragmentMetadata(id=0, files=[], physical_rows=len(ids))]
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", partially_failing_write)
+    retry_params: dict[str, Any] = {
+        "description": "write lance fragments",
+        "match": ["LanceError(IO)"],
+        "max_backoff_s": 0,
+    }
+    if explicit_max_attempts:
+        retry_params["max_attempts"] = failures + 1
+
+    result = write_fragment(
+        input_blocks(), "memory://retry-replay", retry_params=retry_params
+    )
+
+    assert len(attempts) == failures + 1
+    assert (
+        attempts[:-1] == [expected_ids[: failure_after_batches * batch_rows]] * failures
+    )
+    assert attempts[-1] == expected_ids
+    assert generated_batches == list(range(10))
+    assert len({id(reader) for reader in readers}) == failures + 1
+    assert sum(fragment.num_rows for fragment, _ in result) == len(expected_ids)
+
+
+@pytest.fixture
+def replay_files(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[IO[bytes]]]:
+    """Track real temporary files without depending on platform unlink behavior."""
+    temporary_file = tempfile.TemporaryFile
+    files: list[IO[bytes]] = []
+
+    def tracked_file(*args: Any, **kwargs: Any) -> IO[bytes]:
+        file: IO[bytes] = temporary_file(*args, **kwargs)
+        files.append(file)
+        return file
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", tracked_file)
+    yield files
+    assert all(file.closed for file in files)
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2])
+@pytest.mark.parametrize("result_kind", ["early", "short", "long"])
+def test_write_fragment_rejects_incomplete_result(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_files: list[IO[bytes]],
+    max_attempts: int,
+    result_kind: str,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    generated: list[int] = []
+    calls = 0
+
+    def input_blocks() -> Iterator[pa.Table]:
+        for value in range(4):
+            generated.append(value)
+            yield pa.table({"id": [value]})
+
+    def incomplete_write(
+        reader: pa.RecordBatchReader, _uri: str, **_kwargs: Any
+    ) -> list[FragmentMetadata]:
+        nonlocal calls
+        calls += 1
+        if result_kind == "early":
+            rows = next(reader).num_rows
+        else:
+            rows = sum(batch.num_rows for batch in reader)
+            rows += -1 if result_kind == "short" else 1
+        return [FragmentMetadata(id=0, files=[], physical_rows=rows)]
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", incomplete_write)
+    wrote = {"early": 1, "short": 3, "long": 5}[result_kind]
+    with pytest.raises(RuntimeError, match=f"expected 4, wrote {wrote}"):
+        write_fragment(
+            input_blocks(),
+            "memory://incomplete-result",
+            retry_params={
+                "description": "write lance fragments",
+                "max_attempts": max_attempts,
+                "max_backoff_s": 0,
+            },
+        )
+
+    assert calls == 1  # Integrity errors must not be retried, even with match=None.
+    assert generated == list(range(4))
+    assert len(replay_files) == (1 if max_attempts > 1 else 0)
+    assert all(file.closed for file in replay_files)
+
+
+@pytest.mark.parametrize("explicit_max_attempts", [False, True])
+def test_write_fragment_single_attempt_remains_streaming(
+    monkeypatch: pytest.MonkeyPatch, explicit_max_attempts: bool
+) -> None:
+    import lance.fragment as lance_fragment
+
+    generated: list[int] = []
+
+    def input_blocks() -> Iterator[pa.Table]:
+        for value in range(4):
+            generated.append(value)
+            yield pa.table({"id": [value]})
+
+    def unexpected_spool(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("single-attempt writes must not create a replay file")
+
+    def streaming_write(
+        reader: pa.RecordBatchReader, _uri: str, **_kwargs: Any
+    ) -> list[FragmentMetadata]:
+        assert generated == [0]  # Only schema inference may look ahead.
+        for value in range(4):
+            assert next(reader).column("id").to_pylist() == [value]
+            assert generated == list(range(value + 1))
+        return [FragmentMetadata(id=0, files=[], physical_rows=4)]
+
+    monkeypatch.setattr("lance_ray.fragment.tempfile.TemporaryFile", unexpected_spool)
+    monkeypatch.setattr(lance_fragment, "write_fragments", streaming_write)
+    retry_params = (
+        {"description": "write lance fragments", "max_attempts": 1}
+        if explicit_max_attempts
+        else None
+    )
+    result = write_fragment(
+        input_blocks(), "memory://streaming", retry_params=retry_params
+    )
+    assert result[0][0].num_rows == 4
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_attempts"),
+    [("LanceError(IO): injected failure", 3), ("invalid write argument", 1)],
+)
+def test_write_fragment_failure_closes_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_files: list[IO[bytes]],
+    message: str,
+    expected_attempts: int,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    calls = 0
+    error = RuntimeError(message)
+
+    def failing_write(
+        reader: pa.RecordBatchReader, _uri: str, **_kwargs: Any
+    ) -> list[FragmentMetadata]:
+        nonlocal calls
+        calls += 1
+        assert next(reader).column("id").to_pylist() == [0, 1]
+        raise error
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", failing_write)
+    with pytest.raises(RuntimeError) as exc_info:
+        write_fragment(
+            [pa.table({"id": [0, 1]}), pa.table({"id": [2, 3]})],
+            "memory://write-failure",
+            retry_params={
+                "description": "write lance fragments",
+                "match": ["LanceError(IO)"],
+                "max_attempts": 3,
+                "max_backoff_s": 0,
+            },
+        )
+    assert exc_info.value is error
+    assert calls == expected_attempts
+    assert len(replay_files) == 1
+    assert replay_files[0].closed
+
+
+@pytest.mark.parametrize("failure", ["input", "conversion", "ipc"])
+def test_write_fragment_spool_failure_closes_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_files: list[IO[bytes]],
+    failure: str,
+) -> None:
+    import lance.fragment as lance_fragment
+    from lance_ray.pandas import pd_to_arrow
+
+    calls = 0
+    converted_blocks = 0
+    new_stream = pa.ipc.new_stream
+    error = OSError("injected spooling failure")
+
+    def input_blocks() -> Iterator[pa.Table]:
+        yield pa.table({"id": [0, 1]})
+        if failure == "input":
+            raise error
+        yield pa.table({"id": [2, 3]})
+
+    def failing_converter(
+        block: pa.Table | pd.DataFrame | dict[str, Any], schema: Optional[pa.Schema]
+    ) -> pa.Table:
+        nonlocal converted_blocks
+        converted_blocks += 1
+        if converted_blocks == 2:
+            raise error
+        return pd_to_arrow(block, schema)
+
+    @contextmanager
+    def failing_stream(
+        sink: IO[bytes], schema: pa.Schema
+    ) -> Iterator[pa.RecordBatchStreamWriter]:
+        with new_stream(cast(io.IOBase, sink), schema) as writer:
+            yield writer
+        # A flush/close error must also prevent any destination write.
+        raise error
+
+    def unexpected_write(*_args: Any, **_kwargs: Any) -> list[FragmentMetadata]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("failed spooling must not reach the destination writer")
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", unexpected_write)
+    if failure == "ipc":
+        monkeypatch.setattr(pa.ipc, "new_stream", failing_stream)
+    elif failure == "conversion":
+        monkeypatch.setattr("lance_ray.fragment.pd_to_arrow", failing_converter)
+    with pytest.raises(OSError) as exc_info:
+        write_fragment(
+            input_blocks(),
+            "memory://spool-failure",
+            retry_params={
+                "description": "write lance fragments",
+                "max_attempts": 3,
+                "max_backoff_s": 0,
+            },
+        )
+    assert exc_info.value is error
+    assert calls == 0
+    assert len(replay_files) == 1
+    assert replay_files[0].closed
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2])
+@pytest.mark.parametrize(
+    "input_kind", ["arrow", "pandas", "dict", "zero_rows", "empty"]
+)
+def test_write_fragment_input_compatibility(
+    tmp_path: Path,
+    replay_files: list[IO[bytes]],
+    max_attempts: int,
+    input_kind: str,
+) -> None:
+    schema = pa.schema([pa.field("id", pa.int64())], metadata={b"source": b"test"})
+    table = pa.table({"id": [0, 1, 2, 3]}, schema=schema)
+    blocks: list[pa.Table | pd.DataFrame | dict[str, Any]]
+    if input_kind == "pandas":
+        blocks = [table.to_pandas()]
+    elif input_kind == "dict":
+        blocks = [table.to_pydict()]
+    elif input_kind == "zero_rows":
+        blocks = [table.slice(0, 0)]
+    elif input_kind == "empty":
+        blocks = []
+    else:
+        blocks = [table]
+    result = write_fragment(
+        iter(blocks),
+        str(tmp_path / "input.lance"),
+        schema=schema,
+        retry_params={
+            "description": "write lance fragments",
+            "max_attempts": max_attempts,
+        },
+    )
+    expected_rows = 0 if input_kind in {"zero_rows", "empty"} else 4
+    assert sum(fragment.num_rows for fragment, _ in result) == expected_rows
+    assert all(
+        result_schema.equals(schema, check_metadata=True) for _, result_schema in result
+    )
+    assert len(replay_files) == (1 if max_attempts > 1 and blocks else 0)
+    assert all(file.closed for file in replay_files)
+
+
+@pytest.mark.parametrize("via_datasink", [False, True])
+@pytest.mark.parametrize("failure_after_batches", [5, 10])
+def test_write_fragment_retry_commits_all_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    replay_files: list[IO[bytes]],
+    via_datasink: bool,
+    failure_after_batches: int,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    real_write = lance_fragment.write_fragments
+    attempts: list[int] = []
+    uri = str(tmp_path / "retry.lance")
+    schema = pa.schema([pa.field("id", pa.int64())])
+
+    def injected_write(
+        reader: pa.RecordBatchReader, uri: str, **kwargs: Any
+    ) -> list[FragmentMetadata]:
+        if not attempts:
+            table = pa.Table.from_batches(
+                [next(reader) for _ in range(failure_after_batches)]
+            )
+            partial = real_write(table, uri, return_transaction=False, **kwargs)
+            attempts.append(sum(fragment.num_rows for fragment in partial))
+            raise RuntimeError("LanceError(IO): injected after partial file write")
+        result = real_write(reader, uri, return_transaction=False, **kwargs)
+        attempts.append(sum(fragment.num_rows for fragment in result))
+        return result
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", injected_write)
+    blocks = (
+        pa.table({"id": range(i * 4_096, (i + 1) * 4_096)}, schema=schema)
+        for i in range(10)
+    )
+    if via_datasink:
+        # Keep the Datasink's default attempt count and error matching.
+        monkeypatch.setattr(
+            LanceDatasink, "WRITE_FRAGMENTS_RETRY_MAX_BACKOFF_SECONDS", 0
+        )
+        sink = LanceDatasink(uri, schema=schema)
+        sink.on_write_start()
+        write_return = sink.write(blocks, None)
+        sink.on_write_complete([write_return])
+    else:
+        fragments = write_fragment(
+            blocks,
+            uri,
+            schema=schema,
+            retry_params={
+                "description": "write lance fragments",
+                "match": ["LanceError(IO)"],
+                "max_attempts": 2,
+                "max_backoff_s": 0,
+            },
+        )
+        lance.LanceDataset.commit(
+            uri, lance.LanceOperation.Overwrite(schema, [f for f, _ in fragments])
+        )
+
+    dataset = lance.dataset(uri)
+    assert attempts == [failure_after_batches * 4_096, 40_960]
+    assert dataset.count_rows() == 40_960
+    assert dataset.to_table()["id"].to_pylist() == list(range(40_960))
+    assert len(replay_files) == 1
+    assert replay_files[0].closed
 
 
 def test_fragment_writer_external_blob_options_fail_fast(

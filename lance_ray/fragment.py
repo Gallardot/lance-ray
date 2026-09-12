@@ -3,6 +3,7 @@
 
 import inspect
 import pickle
+import tempfile
 import warnings
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from itertools import chain
@@ -59,6 +60,12 @@ def write_fragment(
     table_id: Optional[list[str]] = None,
     retry_params: Optional[dict[str, Any]] = None,
 ) -> list[tuple["FragmentMetadata", pa.Schema]]:
+    """Write uncommitted fragments, checking their total row count against input.
+
+    Without ``retry_params``, write once using a streaming reader. When multiple
+    attempts are allowed, spool this call's input to a temporary Arrow IPC stream
+    before writing, then open a fresh reader for each attempt.
+    """
     from lance.dependencies import _PANDAS_AVAILABLE
     from lance.dependencies import pandas as pd
     from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, write_fragments
@@ -86,16 +93,19 @@ def write_fragment(
 
     stream = chain([first], stream_iter)
 
+    input_rows = 0
+
     def record_batch_converter() -> Iterator[pa.RecordBatch]:
+        nonlocal input_rows
         for block in stream:
             tbl = pd_to_arrow(block, schema)
-            yield from tbl.to_batches()
+            for batch in tbl.to_batches():
+                input_rows += batch.num_rows
+                yield batch
 
     max_bytes_per_file = (
         DEFAULT_MAX_BYTES_PER_FILE if max_bytes_per_file is None else max_bytes_per_file
     )
-
-    reader = pa.RecordBatchReader.from_batches(schema, record_batch_converter())
 
     # Use default retry params if not provided
     if retry_params is None:
@@ -121,7 +131,7 @@ def write_fragment(
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
     )
 
-    def _write_fragments() -> list["FragmentMetadata"]:
+    def _write_fragments(reader: pa.RecordBatchReader) -> list["FragmentMetadata"]:
         # ``write_fragments`` is overloaded on ``return_transaction``. The
         # version-dependent kwargs are assembled dynamically, which makes mypy
         # pick the ``return_transaction=True`` overload; ``return_transaction``
@@ -143,7 +153,40 @@ def write_fragment(
             **optional_write_kwargs,
         )
 
-    fragments = call_with_retry(_write_fragments, **retry_params)
+    if retry_params.get("max_attempts", 10) > 1:
+        # A failed write can consume part or all of its reader. Spool the input
+        # once so every attempt replays the same batches from the beginning.
+        with tempfile.TemporaryFile(mode="w+b") as replay:
+            with pa.ipc.new_stream(replay, schema) as writer:
+                for batch in record_batch_converter():
+                    writer.write_batch(batch)
+
+            def write_once() -> list["FragmentMetadata"]:
+                replay.seek(0)
+                with pa.ipc.open_stream(replay) as reader:
+                    return _write_fragments(reader)
+
+            fragments = call_with_retry(write_once, **retry_params)
+    else:
+        with pa.RecordBatchReader.from_batches(
+            schema, record_batch_converter()
+        ) as reader:
+
+            def write_once_streaming() -> list["FragmentMetadata"]:
+                return _write_fragments(reader)
+
+            fragments = call_with_retry(write_once_streaming, **retry_params)
+            # Include any unexpected unread remainder in the input row count
+            # so an early return from the writer cannot hide missing rows.
+            for _ in reader:
+                pass
+
+    fragment_rows = sum(fragment.num_rows for fragment in fragments)
+    if fragment_rows != input_rows:
+        raise RuntimeError(
+            "Lance fragment write row count mismatch: "
+            f"expected {input_rows}, wrote {fragment_rows}"
+        )
     return [(fragment, schema) for fragment in fragments]
 
 
@@ -325,6 +368,11 @@ class LanceFragmentWriter:
         Retry parameters for write operations. Default is None.
         If provided, should contain keys like 'description', 'match',
         'max_attempts', and 'max_backoff_s'.
+        None means a single streaming attempt. Allowing multiple attempts spools
+        the complete input of each write call to a temporary Arrow IPC stream,
+        even if the first attempt succeeds. Configure the worker's temporary
+        directory (for example, with TMPDIR) with enough space for concurrent
+        writes. max_bytes_per_file does not limit this temporary storage.
 
     """
 
