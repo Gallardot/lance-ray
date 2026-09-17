@@ -86,10 +86,11 @@ def write_fragment(
 ) -> list[tuple["FragmentMetadata", pa.Schema]]:
     """Write uncommitted fragments, checking their total row count against input.
 
-    Without ``retry_params``, write once using a streaming reader. When multiple
-    attempts are allowed, spool this call's input to a temporary Arrow IPC stream
-    before writing, then open a fresh reader for each attempt. The stream stays
-    in memory up to 128 MiB by default, then rolls entirely to a temporary file.
+    Without an explicit ``retry_params["max_attempts"]``, write once using a
+    streaming reader. When multiple attempts are allowed, spool this call's input
+    to a temporary Arrow IPC stream before writing, then open a fresh reader for
+    each attempt. The stream stays in memory up to 128 MiB by default, then rolls
+    entirely to a temporary file.
     ``LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES`` overrides this threshold
     per call; zero forces disk immediately. Invalid values raise ``ValueError``
     only for nonempty, retry-enabled calls. This is not a peak memory limit:
@@ -144,6 +145,9 @@ def write_fragment(
             "max_attempts": 1,
             "max_backoff_s": 0,
         }
+    else:
+        # Override Ray's default of ten attempts without changing the caller's dict.
+        retry_params = {"max_attempts": 1, **retry_params}
 
     write_kwargs = get_write_fragments_kwargs(
         namespace_impl, namespace_properties, table_id
@@ -182,7 +186,7 @@ def write_fragment(
             **optional_write_kwargs,
         )
 
-    if retry_params.get("max_attempts", 10) > 1:
+    if retry_params["max_attempts"] > 1:
         # A failed write can consume part or all of its reader. Spool the input
         # once so every attempt replays the same batches from the beginning.
         threshold = _write_replay_memory_threshold()
@@ -404,10 +408,11 @@ class LanceFragmentWriter:
         Retry parameters for write operations. Default is None.
         If provided, should contain keys like 'description', 'match',
         'max_attempts', and 'max_backoff_s'.
-        None means a single streaming attempt. Allowing multiple attempts spools
-        the complete input of each write call to a temporary Arrow IPC stream,
-        even if the first attempt succeeds. The default memory threshold is
-        128 MiB, configurable per call with the worker environment variable
+        None or an omitted 'max_attempts' means a single streaming attempt.
+        Allowing multiple attempts spools the complete input of each write call
+        to a temporary Arrow IPC stream, even if the first attempt succeeds.
+        The default memory threshold is 128 MiB, configurable per call with the
+        worker environment variable
         LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES (zero forces disk).
         Exceeding the threshold moves the entire stream to the worker's
         temporary directory (for example, configured with TMPDIR). Budget for

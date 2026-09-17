@@ -44,6 +44,10 @@ Write a Ray Dataset to Lance format.
 `LanceDatasink`, used by the default `write_lance` path, allows up to ten fragment
 write attempts for matching I/O errors. Direct calls to `write_fragment`, and
 `LanceFragmentWriter` without `retry_params`, use one streaming attempt.
+Providing `retry_params` without `max_attempts` also means a single attempt:
+errors propagate without retrying, and no input is staged. Set `max_attempts`
+explicitly above one to enable retries. `LanceDatasink` explicitly sets its
+ten-attempt policy, so its default behavior is unchanged.
 
 When multiple attempts are allowed, each write call first converts its complete
 input to an Arrow IPC stream using Python's `SpooledTemporaryFile`. Every

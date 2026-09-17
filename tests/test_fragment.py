@@ -40,13 +40,11 @@ def _write_fragments_with_external_blob_options(
 
 @pytest.mark.parametrize("failure_after_batches", [1, 5, 10])
 @pytest.mark.parametrize("failures", [1, 2])
-@pytest.mark.parametrize("explicit_max_attempts", [False, True])
 @pytest.mark.usefixtures("replay_storage", "replay_files")
 def test_write_fragment_retry_replays_complete_input(
     monkeypatch: pytest.MonkeyPatch,
     failure_after_batches: int,
     failures: int,
-    explicit_max_attempts: bool,
 ) -> None:
     import lance.fragment as lance_fragment
 
@@ -80,9 +78,8 @@ def test_write_fragment_retry_replays_complete_input(
         "description": "write lance fragments",
         "match": ["LanceError(IO)"],
         "max_backoff_s": 0,
+        "max_attempts": failures + 1,
     }
-    if explicit_max_attempts:
-        retry_params["max_attempts"] = failures + 1
 
     result = write_fragment(
         input_blocks(), "memory://retry-replay", retry_params=retry_params
@@ -351,9 +348,13 @@ def test_write_fragment_rejects_incomplete_result(
     assert all(file.closed for file in replay_files)
 
 
-@pytest.mark.parametrize("explicit_max_attempts", [False, True])
+@pytest.mark.parametrize(
+    "retry_params",
+    [None, {"description": "write"}, {"description": "write", "max_attempts": 1}],
+    ids=["default", "omitted-attempts", "explicit-single-attempt"],
+)
 def test_write_fragment_single_attempt_remains_streaming(
-    monkeypatch: pytest.MonkeyPatch, explicit_max_attempts: bool
+    monkeypatch: pytest.MonkeyPatch, retry_params: Optional[dict[str, Any]]
 ) -> None:
     import lance.fragment as lance_fragment
 
@@ -380,15 +381,53 @@ def test_write_fragment_single_attempt_remains_streaming(
     monkeypatch.setattr(tempfile, "SpooledTemporaryFile", unexpected_spool)
     monkeypatch.setattr(tempfile, "TemporaryFile", unexpected_spool)
     monkeypatch.setattr(lance_fragment, "write_fragments", streaming_write)
-    retry_params = (
-        {"description": "write lance fragments", "max_attempts": 1}
-        if explicit_max_attempts
-        else None
-    )
     result = write_fragment(
         input_blocks(), "memory://streaming", retry_params=retry_params
     )
     assert result[0][0].num_rows == 4
+
+
+@pytest.mark.parametrize("failure_after_batches", [1, 4])
+def test_write_fragment_omitted_attempts_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_files: list[tempfile.SpooledTemporaryFile[bytes]],
+    failure_after_batches: int,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    calls = 0
+    generated: list[int] = []
+    error = RuntimeError("LanceError(IO): injected write failure")
+    retry_params: dict[str, Any] = {
+        "description": "write lance fragments",
+        "match": ["LanceError(IO)"],
+        "max_backoff_s": 0,
+    }
+    original_params = retry_params.copy()
+
+    def input_blocks() -> Iterator[pa.Table]:
+        for value in range(4):
+            generated.append(value)
+            yield pa.table({"id": [value]})
+
+    def failing_write(
+        reader: pa.RecordBatchReader, _uri: str, **_kwargs: Any
+    ) -> list[FragmentMetadata]:
+        nonlocal calls
+        calls += 1
+        for _ in range(failure_after_batches):
+            next(reader)
+        raise error
+
+    monkeypatch.setenv(REPLAY_THRESHOLD_ENV, "invalid")
+    monkeypatch.setattr(lance_fragment, "write_fragments", failing_write)
+    with pytest.raises(RuntimeError) as exc_info:
+        write_fragment(input_blocks(), "memory://no-retry", retry_params=retry_params)
+    assert exc_info.value is error
+    assert calls == 1
+    assert generated == list(range(failure_after_batches))
+    assert replay_files == []
+    assert retry_params == original_params
 
 
 @pytest.mark.parametrize(
