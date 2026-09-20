@@ -2,18 +2,17 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import inspect
-import io
-import os
 import pickle
-import tempfile
 import warnings
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from contextlib import ExitStack
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
     Optional,
+    TypeAlias,
     Union,
     cast,
 )
@@ -27,6 +26,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "FragmentBlock",
+    "FragmentStream",
+    "FragmentStreamFactory",
     "LanceFragmentWriter",
     "write_fragment",
 ]
@@ -38,31 +40,13 @@ from .utils import (
     normalize_initial_bases,
 )
 
-_WRITE_REPLAY_MEMORY_THRESHOLD_ENV = "LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES"
-_DEFAULT_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES = 128 * 1024 * 1024
-
-
-def _write_replay_memory_threshold() -> int:
-    value = os.environ.get(_WRITE_REPLAY_MEMORY_THRESHOLD_ENV)
-    if value is None:
-        return _DEFAULT_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES
-    try:
-        threshold = int(value)
-    except ValueError:
-        raise ValueError(
-            f"{_WRITE_REPLAY_MEMORY_THRESHOLD_ENV} must be a non-negative integer "
-            "number of bytes"
-        ) from None
-    if threshold < 0:
-        raise ValueError(
-            f"{_WRITE_REPLAY_MEMORY_THRESHOLD_ENV} must be a non-negative integer "
-            "number of bytes"
-        )
-    return threshold
+FragmentBlock: TypeAlias = Union[pa.Table, "pd.DataFrame", dict[str, Any]]
+FragmentStream: TypeAlias = Iterable[FragmentBlock]
+FragmentStreamFactory: TypeAlias = Callable[[], FragmentStream]
 
 
 def write_fragment(
-    stream: Iterable[Union[pa.Table, "pd.DataFrame", dict[str, Any]]],
+    stream: FragmentStream | FragmentStreamFactory,
     uri: str,
     *,
     schema: Optional[pa.Schema] = None,
@@ -86,52 +70,22 @@ def write_fragment(
 ) -> list[tuple["FragmentMetadata", pa.Schema]]:
     """Write uncommitted fragments, checking their total row count against input.
 
-    Without an explicit ``retry_params["max_attempts"]``, write once using a
-    streaming reader. When multiple attempts are allowed, spool this call's input
-    to a temporary Arrow IPC stream before writing, then open a fresh reader for
-    each attempt. The stream stays in memory up to 128 MiB by default, then rolls
-    entirely to a temporary file.
-    ``LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES`` overrides this threshold
-    per call; zero forces disk immediately. Invalid values raise ``ValueError``
-    only for nonempty, retry-enabled calls. This is not a peak memory limit:
-    writes can overshoot it, and source data and Arrow buffers need extra memory.
+    Without an explicit ``retry_params["max_attempts"]``, consume the input
+    once using a streaming reader. Multiple attempts require a replayable
+    iterable or a zero-argument factory returning a fresh stream per attempt;
+    directly supplied one-shot iterators are rejected before consumption.
+    The caller must ensure each iteration produces complete, logically
+    equivalent input. A factory returning the same generator is not sufficient.
+
+    Each attempt recreates the reader and infers its schema independently.
+    Factory/reiterable-created iterators supporting ``close()`` are closed on
+    exit; caller-supplied one-shot iterators remain the caller's responsibility.
+    No input is staged or serialized for replay. Row-count validation does not
+    check content equivalence or clean up files from failed attempts.
     """
     from lance.dependencies import _PANDAS_AVAILABLE
     from lance.dependencies import pandas as pd
     from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, write_fragments
-
-    stream_iter = iter(stream)
-    try:
-        first = next(stream_iter)
-    except StopIteration:
-        return []
-
-    if schema is None:
-        if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
-            schema = pa.Schema.from_pandas(first).remove_metadata()
-        elif isinstance(first, dict):
-            tbl = pa.Table.from_pydict(first)
-            schema = tbl.schema.remove_metadata()
-        else:
-            # Neither a pandas DataFrame nor a dict, so the block is an Arrow
-            # table (a DataFrame cannot reach here: it implies pandas is
-            # importable, which makes ``_PANDAS_AVAILABLE`` true).
-            schema = cast(pa.Table, first).schema
-
-    if schema is None or len(schema.names) == 0:
-        return []
-
-    stream = chain([first], stream_iter)
-
-    input_rows = 0
-
-    def record_batch_converter() -> Iterator[pa.RecordBatch]:
-        nonlocal input_rows
-        for block in stream:
-            tbl = pd_to_arrow(block, schema)
-            for batch in tbl.to_batches():
-                input_rows += batch.num_rows
-                yield batch
 
     max_bytes_per_file = (
         DEFAULT_MAX_BYTES_PER_FILE if max_bytes_per_file is None else max_bytes_per_file
@@ -149,22 +103,33 @@ def write_fragment(
         # Override Ray's default of ten attempts without changing the caller's dict.
         retry_params = {"max_attempts": 1, **retry_params}
 
-    write_kwargs = get_write_fragments_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-    initial_bases_kwargs: dict[str, Any] = {}
-    if initial_bases:
-        initial_bases_kwargs["initial_bases"] = materialize_initial_bases(initial_bases)
+    if retry_params["max_attempts"] > 1 and isinstance(stream, Iterator):
+        raise TypeError(
+            "Retry-enabled write_fragment requires a stream factory or a "
+            "replayable iterable, not a one-shot Iterator. Pass the generator "
+            "function instead of calling it, or use a list or tuple."
+        )
 
-    optional_write_kwargs = _get_optional_write_fragments_kwargs(
-        write_fragments,
-        target_bases=target_bases,
-        base_store_params=base_store_params,
-        external_blob_mode=external_blob_mode,
-        allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-    )
+    def _write_fragments(
+        reader: pa.RecordBatchReader, attempt_schema: pa.Schema
+    ) -> list["FragmentMetadata"]:
+        write_kwargs = get_write_fragments_kwargs(
+            namespace_impl, namespace_properties, table_id
+        )
+        initial_bases_kwargs: dict[str, Any] = {}
+        if initial_bases:
+            initial_bases_kwargs["initial_bases"] = materialize_initial_bases(
+                initial_bases
+            )
 
-    def _write_fragments(reader: pa.RecordBatchReader) -> list["FragmentMetadata"]:
+        optional_write_kwargs = _get_optional_write_fragments_kwargs(
+            write_fragments,
+            target_bases=target_bases,
+            base_store_params=base_store_params,
+            external_blob_mode=external_blob_mode,
+            allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+        )
+
         # ``write_fragments`` is overloaded on ``return_transaction``. The
         # version-dependent kwargs are assembled dynamically, which makes mypy
         # pick the ``return_transaction=True`` overload; ``return_transaction``
@@ -172,7 +137,7 @@ def write_fragment(
         return write_fragments(  # type: ignore[return-value]
             reader,
             uri,
-            schema=schema,
+            schema=attempt_schema,
             max_rows_per_file=max_rows_per_file,
             # ``None`` means "use the writer default" upstream, even though
             # pylance annotates the parameter as a plain ``int``.
@@ -186,48 +151,64 @@ def write_fragment(
             **optional_write_kwargs,
         )
 
-    if retry_params["max_attempts"] > 1:
-        # A failed write can consume part or all of its reader. Spool the input
-        # once so every attempt replays the same batches from the beginning.
-        threshold = _write_replay_memory_threshold()
-        with tempfile.SpooledTemporaryFile(max_size=threshold, mode="w+b") as replay:
-            # max_size=0 disables automatic rollover in the standard library.
-            if threshold == 0:
-                replay.rollover()
-            # Python 3.10's spool is file-like but does not inherit IOBase,
-            # which the Arrow stubs require. Arrow accepts it at runtime.
-            replay_stream = cast(io.IOBase, replay)
-            with pa.ipc.new_stream(replay_stream, schema) as writer:
-                for batch in record_batch_converter():
-                    writer.write_batch(batch)
+    def write_once() -> tuple[list["FragmentMetadata"], Optional[pa.Schema], int]:
+        with ExitStack() as resources:
+            stream_iter = iter(stream() if callable(stream) else stream)
+            if callable(stream) or not isinstance(stream, Iterator):
+                close = getattr(stream_iter, "close", None)
+                if callable(close):
+                    resources.callback(close)
+            try:
+                first = next(stream_iter)
+            except StopIteration:
+                return [], schema, 0
 
-            def write_once() -> list["FragmentMetadata"]:
-                replay.seek(0)
-                with pa.ipc.open_stream(replay_stream) as reader:
-                    return _write_fragments(reader)
+            attempt_schema = schema
+            if attempt_schema is None:
+                if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
+                    attempt_schema = pa.Schema.from_pandas(first).remove_metadata()
+                elif isinstance(first, dict):
+                    attempt_schema = pa.Table.from_pydict(
+                        first
+                    ).schema.remove_metadata()
+                else:
+                    attempt_schema = cast(pa.Table, first).schema
 
-            fragments = call_with_retry(write_once, **retry_params)
-    else:
-        with pa.RecordBatchReader.from_batches(
-            schema, record_batch_converter()
-        ) as reader:
+            if len(attempt_schema.names) == 0:
+                return [], attempt_schema, 0
 
-            def write_once_streaming() -> list["FragmentMetadata"]:
-                return _write_fragments(reader)
+            input_rows = 0
 
-            fragments = call_with_retry(write_once_streaming, **retry_params)
-            # Include any unexpected unread remainder in the input row count
-            # so an early return from the writer cannot hide missing rows.
+            def record_batch_converter() -> Generator[pa.RecordBatch, None, None]:
+                nonlocal input_rows
+                for block in chain([first], stream_iter):
+                    table = pd_to_arrow(block, attempt_schema)
+                    for batch in table.to_batches():
+                        input_rows += batch.num_rows
+                        yield batch
+
+            batches = record_batch_converter()
+            resources.callback(batches.close)
+            reader = resources.enter_context(
+                pa.RecordBatchReader.from_batches(attempt_schema, batches)
+            )
+            fragments = _write_fragments(reader, attempt_schema)
+            # Include an unexpected unread remainder so an early return from
+            # the writer cannot hide missing rows.
             for _ in reader:
                 pass
+            return fragments, attempt_schema, input_rows
 
+    fragments, result_schema, input_rows = call_with_retry(write_once, **retry_params)
     fragment_rows = sum(fragment.num_rows for fragment in fragments)
     if fragment_rows != input_rows:
         raise RuntimeError(
             "Lance fragment write row count mismatch: "
             f"expected {input_rows}, wrote {fragment_rows}"
         )
-    return [(fragment, schema) for fragment in fragments]
+    if result_schema is None:
+        return []
+    return [(fragment, result_schema) for fragment in fragments]
 
 
 def _get_optional_write_fragments_kwargs(
@@ -359,8 +340,10 @@ class LanceFragmentWriter:
 
         Then use the returned location as the uri. This ensures all distributed workers
         write to the same resolved location.
-    transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
-        A callable to transform the input batch. Default is None.
+    transform : Callable[[pa.Table], Union[pa.Table, Iterable[pa.Table]]], optional
+        A callable to transform the input batch. Default is None. Each retry
+        invokes it again with the same original Arrow table. It must produce
+        logically equivalent output; callers must handle repeated side effects.
     schema : pyarrow.Schema, optional
         The schema of the dataset.
     max_rows_per_file : int, optional
@@ -409,16 +392,9 @@ class LanceFragmentWriter:
         If provided, should contain keys like 'description', 'match',
         'max_attempts', and 'max_backoff_s'.
         None or an omitted 'max_attempts' means a single streaming attempt.
-        Allowing multiple attempts spools the complete input of each write call
-        to a temporary Arrow IPC stream, even if the first attempt succeeds.
-        The default memory threshold is 128 MiB, configurable per call with the
-        worker environment variable
-        LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES (zero forces disk).
-        Exceeding the threshold moves the entire stream to the worker's
-        temporary directory (for example, configured with TMPDIR). Budget for
-        concurrent writes, threshold overshoot, source data, and Arrow buffers;
-        this is not a peak memory limit. max_bytes_per_file does not limit
-        replay storage. See the writing guide for Ray environment propagation.
+        Multiple attempts recreate the transformed stream from the original
+        Arrow table, without IPC staging. The transform may execute more than
+        once and must return complete, logically equivalent output each time.
 
     """
 
@@ -426,9 +402,7 @@ class LanceFragmentWriter:
         self,
         uri: str,
         *,
-        transform: Optional[
-            Callable[[pa.Table], pa.Table | Generator[pa.Table, None, None]]
-        ] = None,
+        transform: Optional[Callable[[pa.Table], pa.Table | Iterable[pa.Table]]] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
@@ -512,15 +486,14 @@ class LanceFragmentWriter:
                 # Arrow table is the only remaining documented block type.
                 table = cast(pa.Table, batch)
 
-        transformed = self.transform(table)
-        blocks: Iterable[pa.Table]
-        if isinstance(transformed, Generator):
-            blocks = transformed
-        else:
-            blocks = (t for t in [transformed])
+        def stream_factory() -> Iterator[pa.Table]:
+            transformed = self.transform(table)
+            if isinstance(transformed, pa.Table):
+                return iter((transformed,))
+            return iter(transformed)
 
         fragments = write_fragment(
-            blocks,
+            stream_factory,
             self.uri,
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,

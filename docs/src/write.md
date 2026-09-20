@@ -49,52 +49,60 @@ errors propagate without retrying, and no input is staged. Set `max_attempts`
 explicitly above one to enable retries. `LanceDatasink` explicitly sets its
 ten-attempt policy, so its default behavior is unchanged.
 
-When multiple attempts are allowed, each write call first converts its complete
-input to an Arrow IPC stream using Python's `SpooledTemporaryFile`. Every
-attempt opens a fresh reader at the start of that stream, preventing retries
-from silently omitting batches consumed by a failed attempt. The spool holds
-one write call's complete input, which may produce multiple Lance fragments,
-and is closed on success or failure. Single-attempt writes remain streaming,
-create no spool, and do not read the replay configuration.
+Each attempt creates a new input iterator, schema inference, converter and Arrow
+reader. There is no additional IPC serialization or temporary-file staging.
 
-Small streams stay in memory. When their serialized size exceeds **128 MiB**
-by default, the entire stream moves to a temporary disk file, and subsequent
-writes go to that file. Set a different threshold in bytes with:
-
-```bash
-export LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES=134217728
-```
-
-An unset variable uses the default. A positive integer sets the threshold;
-`0` forces disk storage immediately. Negative values, empty strings, and
-non-integers raise `ValueError` naming the variable, before spool creation or
-destination writing. The setting is read on every retry-enabled call; empty
-input still returns immediately.
-
-For Ray tasks, make the variable available in each **worker's** environment;
-changing only the driver's environment after workers start is insufficient.
-For example, when initializing Ray:
+**Behavior change for direct `write_fragment` calls:** enabling retries with a
+one-shot `Iterator` (including a generator object or an empty iterator) raises
+`TypeError` before consuming input. Pass a factory that creates a fresh stream,
+or a replayable iterable such as a list or tuple:
 
 ```python
-ray.init(runtime_env={
-    "env_vars": {"LANCE_RAY_WRITE_REPLAY_MEMORY_THRESHOLD_BYTES": "134217728"}
-})
+import pyarrow as pa
+from lance_ray.fragment import write_fragment
+
+
+def read_blocks():
+    for start in range(0, 100, 10):
+        yield pa.table({"id": range(start, start + 10)})
+
+
+# A generator object is fine for a single streaming attempt.
+fragments = write_fragment(read_blocks(), "single.lance")
+
+# Pass the function itself so each retry gets a new generator.
+fragments = write_fragment(
+    read_blocks,
+    "retry.lance",
+    retry_params={
+        "description": "write lance fragments",
+        "match": ["LanceError(IO)"],
+        "max_attempts": 3,
+        "max_backoff_s": 8,
+    },
+)
 ```
 
-The threshold is **not a process or node peak memory limit**. Concurrent calls
-each have their own spool, and a single large IPC write may temporarily exceed
-the threshold before automatic rollover. Original Arrow data, serialization
-buffers, and memory used during rollover are outside this threshold. Provision
-memory for their combined usage. Large inputs require disk space for the
-**complete** serialized input, not just the bytes above the threshold. Configure
-the worker's temporary directory through Python's standard `tempfile` settings
-(for example, `TMPDIR`), and provision space for concurrent calls.
-`max_bytes_per_file` limits destination Lance files, not replay space.
+Custom iterables are also accepted. The caller must ensure that **each iteration
+or factory call produces complete, logically equivalent input**. Type checks
+cannot prove that contract; `lambda: existing_generator` does not satisfy it.
+Each attempt closes its reader and any factory/reiterable-created iterator that
+supports `close()`. A directly supplied single-attempt iterator remains the
+caller's responsibility.
 
-Both storage modes fully stage the input before starting the destination write,
-even if the first attempt succeeds. In-memory spooling avoids temporary disk
-I/O for small inputs but still incurs serialization, memory usage, and startup
-delay; rolled streams also incur disk I/O.
+`LanceDatasink` collects all blocks for one write call into a list of references
+and creates a new iterator over that list for each attempt. Ray has already
+resolved those blocks before calling the sink: retaining them does not copy
+Arrow data or rerun upstream computation. It does keep all blocks alive until
+the call finishes, may extend their memory lifetime, and consumes the entire
+block iterable before starting the write. Concurrent writes retain separate
+lists. A single-attempt sink passes its input through without collecting it.
+`max_bytes_per_file` limits destination files, not the memory retained by a call.
+
+`LanceFragmentWriter` converts the original batch to an Arrow table once, then
+reruns its transform for each attempt. The transform may return a table or an
+iterable of tables. It must produce logically equivalent output from the same
+input table; callers must handle any side effects of repeated execution.
 
 Before returning fragments for commit, the writer checks that their total row
 count matches the input and raises `RuntimeError` on a mismatch. This is a row
