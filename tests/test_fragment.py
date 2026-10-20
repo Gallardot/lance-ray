@@ -15,8 +15,8 @@ import lance_ray.io as lr
 import pyarrow as pa
 import pytest
 import ray
-
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, LanceOperation
+from lance.fragment import FragmentMetadata
 from lance_ray.datasink import LanceDatasink, LanceFragmentCommitter
 from lance_ray.fragment import (
     FragmentBlock,
